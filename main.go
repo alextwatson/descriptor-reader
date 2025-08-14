@@ -99,11 +99,13 @@ func main() {
 			state.mu.Lock()
 			if state.paused {
 				state.paused = false
+				state.mu.Unlock()
 			} else {
 				state.paused = true
+				state.mu.Unlock()
+				scanPausedFrame(state, output, w)
 			}
-			state.mu.Unlock()
-			scanPausedFrame(state, output, w)
+
 		}
 	})
 	copyBtn := widget.NewButton("Copy", func() {
@@ -435,8 +437,6 @@ func IsLikelyDescriptor(s string) bool {
 	return bal == 0
 }
 
-// deepDetectAndDecode runs a heavier multi-variant pass and rectifies detected QRs.
-// It returns the first decoded payload found, or "".
 func deepDetectAndDecode(m gocv.Mat) string {
 	log.Printf("deep detect START")
 	det := gocv.NewQRCodeDetector()
@@ -448,11 +448,13 @@ func deepDetectAndDecode(m gocv.Mat) string {
 	}
 	variants := make([]variant, 0, 12)
 	add := func(mat gocv.Mat, tag string) { variants = append(variants, variant{M: mat, tag: tag}) }
-	// Keep track of mats to close (we don't close the original 'm')
+
+	// We'll close everything we allocate here (but NOT the original m)
 	toClose := []gocv.Mat{}
 
 	// Base variants
 	add(m, "raw")
+
 	gray := gocv.NewMat()
 	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
 	add(gray, "gray")
@@ -478,17 +480,38 @@ func deepDetectAndDecode(m gocv.Mat) string {
 	add(inv, "otsu_inverted")
 	toClose = append(toClose, inv)
 
-	adap := gocv.NewMat()
-	gocv.AdaptiveThreshold(gray, &adap, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
-	add(adap, "adaptive")
-	toClose = append(toClose, adap)
+	// (4) Adaptive-threshold grid search (block sizes × C), plus inverted forms
+	for _, bs := range []int{15, 21, 31, 41} {
+		for _, C := range []float32{2, 5, 8} {
+			at := gocv.NewMat()
+			gocv.AdaptiveThreshold(gray, &at, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, bs, C)
+			add(at, fmt.Sprintf("adapt_b%d_c%.0f", bs, C))
+			toClose = append(toClose, at)
 
-	adinv := gocv.NewMat()
-	gocv.BitwiseNot(adap, &adinv)
-	add(adinv, "adaptive_inverted")
-	toClose = append(toClose, adinv)
+			atInv := gocv.NewMat()
+			gocv.BitwiseNot(at, &atInv)
+			add(atInv, fmt.Sprintf("adapt_b%d_c%.0f_inv", bs, C))
+			toClose = append(toClose, atInv)
+		}
+	}
 
-	// Add edge-preserving upscales for small frames (helps tiny modules)
+	// (1) Rotation sweep on a few *representative* variants (keeps variant count sane)
+	addRotations(gray, "gray", add, &toClose)
+	addRotations(eq, "equalize", add, &toClose)
+	// Also rotate one “typical” adaptive combo (31,5) and its inverse
+	{
+		at := gocv.NewMat()
+		gocv.AdaptiveThreshold(gray, &at, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
+		addRotations(at, "adapt_b31_c5", add, &toClose)
+		toClose = append(toClose, at)
+
+		atInv := gocv.NewMat()
+		gocv.BitwiseNot(at, &atInv)
+		addRotations(atInv, "adapt_b31_c5_inv", add, &toClose)
+		toClose = append(toClose, atInv)
+	}
+
+	// Edge-preserving upscales for small frames (helps tiny modules)
 	if m.Cols() < 1400 {
 		base := append([]variant(nil), variants...) // copy current list
 		for _, v := range base {
@@ -499,9 +522,18 @@ func deepDetectAndDecode(m gocv.Mat) string {
 			add(up, v.tag+"+nnx")
 			toClose = append(toClose, up)
 		}
+		// Rotate the upscaled gray as well (cheap + very effective)
+		if len(gray.ToBytes()) > 0 { // guard: ensure gray is valid
+			upg := gocv.NewMat()
+			newW := 1600
+			newH := int(float64(gray.Rows()) * float64(newW) / float64(gray.Cols()))
+			gocv.Resize(gray, &upg, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+			addRotations(upg, "gray+nnx", add, &toClose)
+			toClose = append(toClose, upg)
+		}
 	}
 
-	// Try each variant: detect corners -> decode; if decode fails but corners exist, try rectified 'straight'
+	// Try each variant: OpenCV decode, then rectified salvage via goqr
 	for _, v := range variants {
 		pts := gocv.NewMat()
 		straight := gocv.NewMat()
@@ -511,15 +543,12 @@ func deepDetectAndDecode(m gocv.Mat) string {
 			log.Printf("QR hit via %s", v.tag)
 			pts.Close()
 			straight.Close()
-			// return immediately; caller will gate on IsLikelyDescriptor
-			// (If you prefer to continue searching for a descriptor specifically, move this return after a gate.)
 			for _, c := range toClose {
 				c.Close()
 			}
 			return s
 		}
 
-		// If corners found but decode empty, try rectified patch with goqr.
 		if !pts.Empty() && !straight.Empty() {
 			if img := matToImage(straight); img != nil {
 				if codes, err := goqr.Recognize(img); err == nil && len(codes) > 0 {
@@ -542,4 +571,19 @@ func deepDetectAndDecode(m gocv.Mat) string {
 		c.Close()
 	}
 	return ""
+}
+
+// addRotations creates rotated variants of src at several angles and registers them via add.
+// Angles chosen to cover slight skew + orthogonal cases without exploding the search.
+func addRotations(src gocv.Mat, tag string, add func(gocv.Mat, string), toClose *[]gocv.Mat) {
+	angles := []float64{5, -5, 10, -10, 15, -15, 90, 180, 270}
+	center := image.Pt(src.Cols()/2, src.Rows()/2)
+	for _, a := range angles {
+		M := gocv.GetRotationMatrix2D(center, a, 1.0)
+		dst := gocv.NewMat()
+		gocv.WarpAffine(src, &dst, M, image.Pt(src.Cols(), src.Rows()))
+		add(dst, fmt.Sprintf("%s+rot%.0f", tag, a))
+		*toClose = append(*toClose, dst)
+		M.Close()
+	}
 }
