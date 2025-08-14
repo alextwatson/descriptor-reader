@@ -9,6 +9,8 @@ import (
 	"image/draw"
 	"image/png"
 	"log"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,25 +25,24 @@ import (
 	"gocv.io/x/gocv"
 )
 
-func runOnMain(f func()) { fyne.Do(f) }
-
 type uiState struct {
 	mu         sync.Mutex
 	previewOn  bool
 	paused     bool
-	cancelPrev context.CancelFunc
-	lastFrame  image.Image
 	detected   bool
+	lastFrame  image.Image
+	cancelPrev context.CancelFunc
 }
+
+func runOnMain(f func()) { fyne.Do(f) }
 
 func main() {
 	a := app.New()
-	w := a.NewWindow("Descriptor Reader (Live)")
+	w := a.NewWindow("Descriptor Reader (live)")
 	w.Resize(fyne.NewSize(900, 740))
 
 	img := canvas.NewImageFromImage(nil)
 	img.FillMode = canvas.ImageFillContain
-	img.SetMinSize(fyne.NewSize(900, 520))
 
 	output := widget.NewMultiLineEntry()
 	output.SetPlaceHolder("Descriptor will appear here…")
@@ -76,30 +77,9 @@ func main() {
 		go runPreview(ctx, webcam, img, output, state)
 	}
 
-	stopPreview := func() {
-		state.mu.Lock()
-		if state.cancelPrev != nil {
-			state.cancelPrev()
-		}
-		state.previewOn = false
-		state.cancelPrev = nil
-		state.mu.Unlock()
-	}
-
-	readBtn := widget.NewButton("Read (Auto)", func() {
-		if !state.previewOn {
-			startPreview()
-		}
-	})
-
-	pauseBtn := widget.NewButton("Pause", func() {
+	pauseBtn := widget.NewButton("Pause Preview", func() {
 		state.mu.Lock()
 		state.paused = true
-		state.mu.Unlock()
-	})
-	resumeBtn := widget.NewButton("Resume", func() {
-		state.mu.Lock()
-		state.paused = false
 		state.mu.Unlock()
 	})
 	scanPausedBtn := widget.NewButton("Scan Paused Frame", func() {
@@ -113,14 +93,6 @@ func main() {
 		state.mu.Unlock()
 		startPreview()
 	})
-	copyBtn := widget.NewButton("Copy", func() { a.Clipboard().SetContent(output.Text) })
-
-	w.SetContent(container.NewVBox(
-		img,
-		container.NewHBox(readBtn, pauseBtn, resumeBtn, scanPausedBtn, resetBtn, copyBtn),
-		output,
-	))
-
 	w.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
 		switch k.Name {
 		case fyne.KeySpace:
@@ -134,17 +106,14 @@ func main() {
 			scanPausedFrame(state, output, w)
 		}
 	})
-
-	startPreview()
-
-	w.SetCloseIntercept(func() {
-		stopPreview()
-		if webcam != nil {
-			webcam.Close()
-		}
-		w.Close()
+	copyBtn := widget.NewButton("Copy", func() {
+		w.Clipboard().SetContent(output.Text)
 	})
 
+	controls := container.NewVBox(pauseBtn, scanPausedBtn, resetBtn, copyBtn)
+	w.SetContent(container.NewBorder(nil, output, controls, nil, img))
+
+	startPreview()
 	w.ShowAndRun()
 }
 
@@ -156,24 +125,28 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 		dialog.ShowInformation("Scan", "No paused frame yet.", w)
 		return
 	}
+
+	// Convert paused frame to Mat once
 	mat, err := gocv.ImageToMatRGB(imgCopy)
 	if err != nil {
 		log.Printf("ImageToMatRGB err: %v", err)
+		dialog.ShowInformation("Scan", "Could not convert frame.", w)
+		return
 	}
-	payload := ""
-	if err == nil {
-		payload = tryDecodeOpenCV(mat)
-		mat.Close()
-	}
+	defer mat.Close()
+
+	// Do an in-depth corner-first sweep on the paused frame
+	payload := deepDetectAndDecode(mat)
+	log.Printf("deep detect FINISH")
+
 	if payload == "" {
-		if s, _ := tryDecode(imgCopy); s != "" {
-			payload = s
-		}
+		dialog.ShowInformation("Scan", "No QR detected in paused frame.", w)
+		return
 	}
-	if payload != "" {
+	if IsLikelyDescriptor(payload) {
 		runOnMain(func() { output.SetText(payload) })
 	} else {
-		dialog.ShowInformation("Scan", "No QR detected in paused frame.", w)
+		dialog.ShowInformation("Scan", "QR detected, but it's not a Bitcoin output descriptor.", w)
 	}
 }
 
@@ -217,17 +190,23 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 				payload, bounds = tryDecode(src)
 			}
 			if payload != "" {
-				state.mu.Lock()
-				if state.cancelPrev != nil {
-					state.cancelPrev()
+				log.Printf("payload != \"\"")
+				if IsLikelyDescriptor(payload) {
+					log.Printf("is a descriptor")
+					state.mu.Lock()
+					if state.cancelPrev != nil {
+						state.cancelPrev()
+					}
+					state.previewOn = false
+					state.detected = true
+					state.cancelPrev = nil
+					state.mu.Unlock()
+					annotated := drawBoundingBox(src, bounds)
+					runOnMain(func() { img.Image = annotated; img.Refresh(); out.SetText(payload) })
+					return
+				} else {
+					log.Printf("not a descriptor")
 				}
-				state.previewOn = false
-				state.detected = true
-				state.cancelPrev = nil
-				state.mu.Unlock()
-				annotated := drawBoundingBox(src, bounds)
-				runOnMain(func() { img.Image = annotated; img.Refresh(); out.SetText(payload) })
-				return
 			}
 			runOnMain(func() { img.Image = drawGuideBox(src); img.Refresh() })
 		}
@@ -237,89 +216,131 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 func tryDecodeOpenCV(m gocv.Mat) string {
 	det := gocv.NewQRCodeDetector()
 	defer det.Close()
-	try := func(src gocv.Mat) string {
+
+	// Attempt helper that also logs which path worked.
+	try := func(src gocv.Mat, tag string) string {
 		pts := gocv.NewMat()
 		straight := gocv.NewMat()
 		defer pts.Close()
 		defer straight.Close()
 		s := det.DetectAndDecode(src, &pts, &straight)
 		if s != "" {
-			log.Printf("OpenCV QR hit")
+			log.Printf("QR hit via %s", tag)
 		}
 		return s
 	}
-	if s := try(m); s != "" {
+
+	// 0) Raw frame
+	if s := try(m, "raw"); s != "" {
 		return s
 	}
+
+	// 1) Grayscale
 	gray := gocv.NewMat()
 	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
-	if s := try(gray); s != "" {
-		gray.Close()
+	defer gray.Close()
+	if s := try(gray, "gray"); s != "" {
 		return s
 	}
+
+	// 2) Histogram equalization (helps low contrast)
+	eq := gocv.NewMat()
+	gocv.EqualizeHist(gray, &eq)
+	if s := try(eq, "equalize"); s != "" {
+		eq.Close()
+		return s
+	}
+	eq.Close()
+
+	// 3) Inverted gray (helps white-on-black)
+	ginv := gocv.NewMat()
+	gocv.BitwiseNot(gray, &ginv)
+	if s := try(ginv, "gray_inverted"); s != "" {
+		ginv.Close()
+		return s
+	}
+	ginv.Close()
+
+	// 4) Nearest-neighbor upscale (preserve edges for tiny modules)
 	enlarged := gocv.NewMat()
-	if m.Cols() < 1000 {
-		newW := 1200
+	if m.Cols() < 1400 {
+		newW := 1400
 		newH := int(float64(m.Rows()) * float64(newW) / float64(m.Cols()))
-		gocv.Resize(gray, &enlarged, image.Pt(newW, newH), 0, 0, gocv.InterpolationArea)
-		if s := try(enlarged); s != "" {
-			gray.Close()
+		gocv.Resize(gray, &enlarged, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+		if s := try(enlarged, "nn_upscale(gray)"); s != "" {
 			enlarged.Close()
 			return s
 		}
 	}
+	enlarged.Close()
+
+	// 5) Otsu binarization
 	bin := gocv.NewMat()
 	gocv.Threshold(gray, &bin, 0, 255, gocv.ThresholdBinary|gocv.ThresholdOtsu)
-	if s := try(bin); s != "" {
-		gray.Close()
-		enlarged.Close()
+	if s := try(bin, "otsu"); s != "" {
 		bin.Close()
 		return s
 	}
+
+	// 6) Inverted Otsu
 	inv := gocv.NewMat()
 	gocv.BitwiseNot(bin, &inv)
-	if s := try(inv); s != "" {
-		gray.Close()
-		enlarged.Close()
-		bin.Close()
+	if s := try(inv, "otsu_inverted"); s != "" {
 		inv.Close()
+		bin.Close()
 		return s
 	}
-	gray.Close()
-	enlarged.Close()
-	bin.Close()
 	inv.Close()
+	bin.Close()
+
+	// 7) Adaptive threshold (robust to uneven lighting)
+	adap := gocv.NewMat()
+	gocv.AdaptiveThreshold(gray, &adap, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
+	if s := try(adap, "adaptive"); s != "" {
+		adap.Close()
+		return s
+	}
+
+	// 8) Inverted adaptive
+	adinv := gocv.NewMat()
+	gocv.BitwiseNot(adap, &adinv)
+	if s := try(adinv, "adaptive_inverted"); s != "" {
+		adinv.Close()
+		adap.Close()
+		return s
+	}
+	adinv.Close()
+	adap.Close()
+
 	return ""
 }
 
 func tryDecode(src image.Image) (string, image.Rectangle) {
-	b := src.Bounds()
-	g := image.NewGray(b)
-	draw.Draw(g, b, src, b.Min, draw.Src)
-	codes, err := goqr.Recognize(g)
-	log.Printf("goqr: recognized %d QR(s), err=%v", len(codes), err)
-	if err != nil || len(codes) == 0 {
+	qrCodes, err := goqr.Recognize(src)
+	if err != nil || len(qrCodes) == 0 {
 		return "", image.Rectangle{}
 	}
-	best := codes[0]
-	for _, c := range codes {
-		if len(c.Payload) > len(best.Payload) {
-			best = c
-		}
-	}
-	return string(best.Payload), image.Rectangle{}
+	return string(qrCodes[0].Payload), image.Rectangle{}
 }
 
 func matToImage(m gocv.Mat) image.Image {
 	if m.Empty() {
 		return nil
 	}
-	buf, err := gocv.IMEncode(".png", m)
-	if err != nil {
+	bgra := gocv.NewMat()
+	gocv.CvtColor(m, &bgra, gocv.ColorBGRToBGRA)
+	nbuf, err := gocv.IMEncode(".png", bgra)
+	if err != nil || nbuf == nil {
 		return nil
 	}
-	defer buf.Close()
-	img, err := png.Decode(bytes.NewReader(buf.GetBytes()))
+	defer nbuf.Close()
+
+	buf := nbuf.GetBytes()
+	if len(buf) == 0 {
+		return nil
+	}
+
+	img, err := png.Decode(bytes.NewReader(buf))
 	if err != nil {
 		return nil
 	}
@@ -375,4 +396,150 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// IsLikelyDescriptor: filter for Bitcoin output descriptors
+var (
+	headRe     = regexp.MustCompile(`^(pkh|wpkh|sh|wsh|tr|combo)\(`)
+	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{64})`)
+	checksumRe = regexp.MustCompile(`#[-a-z0-9]{8}$`)
+)
+
+func IsLikelyDescriptor(s string) bool {
+	s = strings.TrimSpace(s)
+	if !headRe.MatchString(s) {
+		return false
+	}
+	if !strings.Contains(s, ")") || len(s) < 20 {
+		return false
+	}
+	if !hasKeyRe.MatchString(s) {
+		return false
+	}
+	if strings.Contains(s, "#") && !checksumRe.MatchString(s) {
+		return false
+	}
+	// Basic paren balance check.
+	bal := 0
+	for _, r := range s {
+		if r == '(' {
+			bal++
+		}
+		if r == ')' {
+			bal--
+		}
+		if bal < 0 {
+			return false
+		}
+	}
+	return bal == 0
+}
+
+// deepDetectAndDecode runs a heavier multi-variant pass and rectifies detected QRs.
+// It returns the first decoded payload found, or "".
+func deepDetectAndDecode(m gocv.Mat) string {
+	log.Printf("deep detect START")
+	det := gocv.NewQRCodeDetector()
+	defer det.Close()
+
+	type variant struct {
+		M   gocv.Mat
+		tag string
+	}
+	variants := make([]variant, 0, 12)
+	add := func(mat gocv.Mat, tag string) { variants = append(variants, variant{M: mat, tag: tag}) }
+	// Keep track of mats to close (we don't close the original 'm')
+	toClose := []gocv.Mat{}
+
+	// Base variants
+	add(m, "raw")
+	gray := gocv.NewMat()
+	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
+	add(gray, "gray")
+	toClose = append(toClose, gray)
+
+	eq := gocv.NewMat()
+	gocv.EqualizeHist(gray, &eq)
+	add(eq, "equalize")
+	toClose = append(toClose, eq)
+
+	ginv := gocv.NewMat()
+	gocv.BitwiseNot(gray, &ginv)
+	add(ginv, "gray_inverted")
+	toClose = append(toClose, ginv)
+
+	bin := gocv.NewMat()
+	gocv.Threshold(gray, &bin, 0, 255, gocv.ThresholdBinary|gocv.ThresholdOtsu)
+	add(bin, "otsu")
+	toClose = append(toClose, bin)
+
+	inv := gocv.NewMat()
+	gocv.BitwiseNot(bin, &inv)
+	add(inv, "otsu_inverted")
+	toClose = append(toClose, inv)
+
+	adap := gocv.NewMat()
+	gocv.AdaptiveThreshold(gray, &adap, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
+	add(adap, "adaptive")
+	toClose = append(toClose, adap)
+
+	adinv := gocv.NewMat()
+	gocv.BitwiseNot(adap, &adinv)
+	add(adinv, "adaptive_inverted")
+	toClose = append(toClose, adinv)
+
+	// Add edge-preserving upscales for small frames (helps tiny modules)
+	if m.Cols() < 1400 {
+		base := append([]variant(nil), variants...) // copy current list
+		for _, v := range base {
+			up := gocv.NewMat()
+			newW := 1600
+			newH := int(float64(v.M.Rows()) * float64(newW) / float64(v.M.Cols()))
+			gocv.Resize(v.M, &up, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+			add(up, v.tag+"+nnx")
+			toClose = append(toClose, up)
+		}
+	}
+
+	// Try each variant: detect corners -> decode; if decode fails but corners exist, try rectified 'straight'
+	for _, v := range variants {
+		pts := gocv.NewMat()
+		straight := gocv.NewMat()
+		s := det.DetectAndDecode(v.M, &pts, &straight)
+
+		if s != "" {
+			log.Printf("QR hit via %s", v.tag)
+			pts.Close()
+			straight.Close()
+			// return immediately; caller will gate on IsLikelyDescriptor
+			// (If you prefer to continue searching for a descriptor specifically, move this return after a gate.)
+			for _, c := range toClose {
+				c.Close()
+			}
+			return s
+		}
+
+		// If corners found but decode empty, try rectified patch with goqr.
+		if !pts.Empty() && !straight.Empty() {
+			if img := matToImage(straight); img != nil {
+				if codes, err := goqr.Recognize(img); err == nil && len(codes) > 0 {
+					s2 := string(codes[0].Payload)
+					log.Printf("QR rectified+goqr hit via %s", v.tag)
+					pts.Close()
+					straight.Close()
+					for _, c := range toClose {
+						c.Close()
+					}
+					return s2
+				}
+			}
+		}
+		pts.Close()
+		straight.Close()
+	}
+
+	for _, c := range toClose {
+		c.Close()
+	}
+	return ""
 }
