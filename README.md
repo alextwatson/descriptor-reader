@@ -35,8 +35,8 @@ go run .
 ```
 Build & run:
 ```bash
-go build -o descriptor-reader
-./descriptor-reader
+go build -o Descriptor-reader
+./Descriptor-reader
 ```
 ## How to Use
 
