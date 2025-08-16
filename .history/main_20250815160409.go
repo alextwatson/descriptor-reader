@@ -25,7 +25,6 @@ import (
 	"gocv.io/x/gocv"
 )
 
-// uistate struct helps control the UI state and synchronization
 type uiState struct {
 	mu         sync.Mutex
 	previewOn  bool
@@ -35,27 +34,22 @@ type uiState struct {
 	cancelPrev context.CancelFunc
 }
 
-func runOnMain(f func()) {
-	fyne.Do(f)
-}
+func runOnMain(f func()) { fyne.Do(f) }
 
 func main() {
-	// Initialize the Fyne app and main window
 	a := app.New()
 	w := a.NewWindow("Descriptor Reader (live)")
 	w.Resize(fyne.NewSize(900, 740))
 
-	// Create UI components
 	img := canvas.NewImageFromImage(nil)
 	img.FillMode = canvas.ImageFillContain
 
-	// Placeholder for the output descriptor
 	output := widget.NewMultiLineEntry()
 	output.SetPlaceHolder("Descriptor will appear here…")
 	output.Wrapping = fyne.TextWrapWord
 
 	state := &uiState{}
-	// Open the webcam
+
 	webcam, err := gocv.OpenVideoCapture(0)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("open camera: %w", err), w)
@@ -80,7 +74,7 @@ func main() {
 		state.paused = false
 		state.detected = false
 		state.mu.Unlock()
-		go runPreview(ctx, webcam, img, output, state, w)
+		go runPreview(ctx, webcam, img, output, state)
 	}
 
 	pauseBtn := widget.NewButton("Pause Preview", func() {
@@ -88,11 +82,9 @@ func main() {
 		state.paused = true
 		state.mu.Unlock()
 	})
-
 	scanPausedBtn := widget.NewButton("Scan Paused Frame", func() {
 		scanPausedFrame(state, output, w)
 	})
-
 	resetBtn := widget.NewButton("Reset", func() {
 		output.SetText("")
 		state.mu.Lock()
@@ -101,7 +93,6 @@ func main() {
 		state.mu.Unlock()
 		startPreview()
 	})
-
 	w.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
 		switch k.Name {
 		case fyne.KeySpace:
@@ -117,12 +108,10 @@ func main() {
 
 		}
 	})
-
 	copyBtn := widget.NewButton("Copy", func() {
 		w.Clipboard().SetContent(output.Text)
 	})
 
-	// Layout the UI components
 	controls := container.NewVBox(pauseBtn, scanPausedBtn, resetBtn, copyBtn)
 	w.SetContent(container.NewBorder(nil, output, controls, nil, img))
 
@@ -130,7 +119,6 @@ func main() {
 	w.ShowAndRun()
 }
 
-// scanPausedFrame processes the currently paused frame for QR codes
 func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 	state.mu.Lock()
 	imgCopy := state.lastFrame
@@ -158,20 +146,13 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 		return
 	}
 	if IsLikelyDescriptor(payload) {
-		node, err := Parse(payload)
-		if err != nil {
-			fmt.Println("Parse error:", err)
-			dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
-		}
-		dialog.ShowInformation("Type", Explain(node), w)
-		log.Printf(Explain(node))
 		runOnMain(func() { output.SetText(payload) })
 	} else {
 		dialog.ShowInformation("Scan", "QR detected, but it's not a Bitcoin output descriptor.", w)
 	}
 }
 
-func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, out *widget.Entry, state *uiState, w fyne.Window) {
+func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, out *widget.Entry, state *uiState) {
 	frame := gocv.NewMat()
 	defer frame.Close()
 	det := gocv.NewQRCodeDetector()
@@ -214,15 +195,6 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 				log.Printf("payload != \"\"")
 				if IsLikelyDescriptor(payload) {
 					log.Printf("is a descriptor")
-
-					node, err := Parse(payload)
-					if err != nil {
-						fmt.Println("Parse error:", err)
-						dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
-					}
-					dialog.ShowInformation("Type", Explain(node), w)
-					log.Printf(Explain(node))
-
 					state.mu.Lock()
 					if state.cancelPrev != nil {
 						state.cancelPrev()
@@ -377,7 +349,6 @@ func matToImage(m gocv.Mat) image.Image {
 	return img
 }
 
-// drawBoundingBox draws a green bounding box around the specified rectangle on the source image.
 func drawBoundingBox(src image.Image, r image.Rectangle) image.Image {
 	if r.Dx() <= 0 || r.Dy() <= 0 {
 		return src
@@ -429,10 +400,10 @@ func min(a, b int) int {
 	return b
 }
 
-// IsLikelyDescriptor checks if a string looks like a Bitcoin output descriptor.
+// IsLikelyDescriptor: filter for Bitcoin output descriptors
 var (
 	headRe     = regexp.MustCompile(`^(pkh|wpkh|sh|wsh|tr|combo)\(`)
-	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{6,})`)
+	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{64})`)
 	checksumRe = regexp.MustCompile(`#[-a-z0-9]{8}$`)
 )
 
@@ -466,7 +437,6 @@ func IsLikelyDescriptor(s string) bool {
 	return bal == 0
 }
 
-// deepDetectAndDecode performs an exhaustive search for QR codes in the given Mat.
 func deepDetectAndDecode(m gocv.Mat) string {
 	log.Printf("deep detect START")
 	det := gocv.NewQRCodeDetector()

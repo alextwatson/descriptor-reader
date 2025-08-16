@@ -80,7 +80,7 @@ func main() {
 		state.paused = false
 		state.detected = false
 		state.mu.Unlock()
-		go runPreview(ctx, webcam, img, output, state, w)
+		go runPreview(ctx, webcam, img, output, state)
 	}
 
 	pauseBtn := widget.NewButton("Pause Preview", func() {
@@ -164,14 +164,13 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 			dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
 		}
 		dialog.ShowInformation("Type", Explain(node), w)
-		log.Printf(Explain(node))
 		runOnMain(func() { output.SetText(payload) })
 	} else {
 		dialog.ShowInformation("Scan", "QR detected, but it's not a Bitcoin output descriptor.", w)
 	}
 }
 
-func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, out *widget.Entry, state *uiState, w fyne.Window) {
+func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, out *widget.Entry, state *uiState) {
 	frame := gocv.NewMat()
 	defer frame.Close()
 	det := gocv.NewQRCodeDetector()
@@ -214,15 +213,6 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 				log.Printf("payload != \"\"")
 				if IsLikelyDescriptor(payload) {
 					log.Printf("is a descriptor")
-
-					node, err := Parse(payload)
-					if err != nil {
-						fmt.Println("Parse error:", err)
-						dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
-					}
-					dialog.ShowInformation("Type", Explain(node), w)
-					log.Printf(Explain(node))
-
 					state.mu.Lock()
 					if state.cancelPrev != nil {
 						state.cancelPrev()
@@ -432,7 +422,7 @@ func min(a, b int) int {
 // IsLikelyDescriptor checks if a string looks like a Bitcoin output descriptor.
 var (
 	headRe     = regexp.MustCompile(`^(pkh|wpkh|sh|wsh|tr|combo)\(`)
-	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{6,})`)
+	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{64})`)
 	checksumRe = regexp.MustCompile(`#[-a-z0-9]{8}$`)
 )
 
