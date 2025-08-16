@@ -169,18 +169,26 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 		// crop QR region
 		cropped := cropImage(imgCopy, bounds)
 
+		// image widget
 		qrImg := canvas.NewImageFromImage(cropped)
 		qrImg.FillMode = canvas.ImageFillContain
-		qrImg.SetMinSize(fyne.NewSize(200, 200))
+		qrImg.SetMinSize(fyne.NewSize(300, 300)) // bigger so it's visible
 
+		// text widget
 		msg := widget.NewLabel(desc)
 		msg.Alignment = fyne.TextAlignLeading
 		msg.Wrapping = fyne.TextWrapWord
 
-		content := container.NewVBox(qrImg, msg)
-		d := dialog.NewCustom("Type", "OK", content, w)
-		d.Resize(fyne.NewSize(450, 450))
-		d.Show()
+		// stack vertically, but give them some space
+		content := container.NewVBox(
+			qrImg,
+			msg,
+		)
+
+		// wrap in a scroll or set min size so dialog isn’t skinny
+		content.Resize(fyne.NewSize(500, 500))
+
+		dialog.ShowCustom("Type", "OK", content, w)
 
 		log.Printf(Explain(node))
 		runOnMain(func() { output.SetText(payload) })
@@ -195,6 +203,7 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 	det := gocv.NewQRCodeDetector()
 	defer det.Close()
 	ticker := time.NewTicker(33 * time.Millisecond)
+	imgCopy := state.lastFrame
 	defer ticker.Stop()
 	for {
 		select {
@@ -223,8 +232,11 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 			state.mu.Lock()
 			state.lastFrame = src
 			state.mu.Unlock()
-			payload, bounds := quickDetect(frame)
-
+			payload := tryDecodeOpenCV(frame)
+			var bounds image.Rectangle
+			if payload == "" {
+				payload, bounds = tryDecode(src)
+			}
 			if payload != "" {
 				log.Printf("payload != \"\"")
 				if IsLikelyDescriptor(payload) {
@@ -238,23 +250,23 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 
 					desc := Explain(node)
 
-					// crop QR region
-					if payload != "" && !bounds.Empty() && src != nil {
-						cropped := cropImage(src, bounds)
+					// crop QR region from last frame
+					cropped := cropImage(imgCopy, bounds)
 
-						qrImg := canvas.NewImageFromImage(cropped)
-						qrImg.FillMode = canvas.ImageFillContain
-						qrImg.SetMinSize(fyne.NewSize(200, 200))
+					// make Fyne image widget
+					qrImg := canvas.NewImageFromImage(cropped)
+					qrImg.FillMode = canvas.ImageFillContain
+					qrImg.SetMinSize(fyne.NewSize(200, 200)) // adjust size as you like
 
-						msg := widget.NewLabel(desc)
-						msg.Alignment = fyne.TextAlignLeading
-						msg.Wrapping = fyne.TextWrapWord
+					// text widget
+					msg := widget.NewLabel(desc)
+					msg.Alignment = fyne.TextAlignLeading
+					msg.Wrapping = fyne.TextWrapWord
 
-						content := container.NewVBox(qrImg, msg)
-						d := dialog.NewCustom("Type", "OK", content, w)
-						d.Resize(fyne.NewSize(450, 450))
-						d.Show()
-					}
+					// combine
+					content := container.NewVBox(msg, qrImg)
+					dialog.ShowCustom("Type", "OK", content, w)
+
 					log.Printf(Explain(node))
 
 					state.mu.Lock()
@@ -277,46 +289,106 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 	}
 }
 
-func quickDetect(m gocv.Mat) (string, image.Rectangle) {
+func tryDecodeOpenCV(m gocv.Mat) string {
 	det := gocv.NewQRCodeDetector()
 	defer det.Close()
 
-	pts := gocv.NewMat()
-	straight := gocv.NewMat()
-	defer pts.Close()
-	defer straight.Close()
-
-	s := det.DetectAndDecode(m, &pts, &straight)
-	if s == "" {
-		return "", image.Rectangle{}
+	// Attempt helper that also logs which path worked.
+	try := func(src gocv.Mat, tag string) string {
+		pts := gocv.NewMat()
+		straight := gocv.NewMat()
+		defer pts.Close()
+		defer straight.Close()
+		s := det.DetectAndDecode(src, &pts, &straight)
+		if s != "" {
+			log.Printf("QR hit via %s", tag)
+		}
+		return s
 	}
 
-	rect := image.Rectangle{}
-	if !pts.Empty() {
-		arr, _ := pts.DataPtrFloat32()
-		if len(arr) >= 8 {
-			minX, minY := int(arr[0]), int(arr[1])
-			maxX, maxY := minX, minY
-			for i := 2; i < 8; i += 2 {
-				x, y := int(arr[i]), int(arr[i+1])
-				if x < minX {
-					minX = x
-				}
-				if y < minY {
-					minY = y
-				}
-				if x > maxX {
-					maxX = x
-				}
-				if y > maxY {
-					maxY = y
-				}
-			}
-			rect = image.Rect(minX, minY, maxX, maxY)
+	// 0) Raw frame
+	if s := try(m, "raw"); s != "" {
+		return s
+	}
+
+	// 1) Grayscale
+	gray := gocv.NewMat()
+	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
+	defer gray.Close()
+	if s := try(gray, "gray"); s != "" {
+		return s
+	}
+
+	// 2) Histogram equalization (helps low contrast)
+	eq := gocv.NewMat()
+	gocv.EqualizeHist(gray, &eq)
+	if s := try(eq, "equalize"); s != "" {
+		eq.Close()
+		return s
+	}
+	eq.Close()
+
+	// 3) Inverted gray (helps white-on-black)
+	ginv := gocv.NewMat()
+	gocv.BitwiseNot(gray, &ginv)
+	if s := try(ginv, "gray_inverted"); s != "" {
+		ginv.Close()
+		return s
+	}
+	ginv.Close()
+
+	// 4) Nearest-neighbor upscale (preserve edges for tiny modules)
+	enlarged := gocv.NewMat()
+	if m.Cols() < 1400 {
+		newW := 1400
+		newH := int(float64(m.Rows()) * float64(newW) / float64(m.Cols()))
+		gocv.Resize(gray, &enlarged, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+		if s := try(enlarged, "nn_upscale(gray)"); s != "" {
+			enlarged.Close()
+			return s
 		}
 	}
+	enlarged.Close()
 
-	return s, rect
+	// 5) Otsu binarization
+	bin := gocv.NewMat()
+	gocv.Threshold(gray, &bin, 0, 255, gocv.ThresholdBinary|gocv.ThresholdOtsu)
+	if s := try(bin, "otsu"); s != "" {
+		bin.Close()
+		return s
+	}
+
+	// 6) Inverted Otsu
+	inv := gocv.NewMat()
+	gocv.BitwiseNot(bin, &inv)
+	if s := try(inv, "otsu_inverted"); s != "" {
+		inv.Close()
+		bin.Close()
+		return s
+	}
+	inv.Close()
+	bin.Close()
+
+	// 7) Adaptive threshold (robust to uneven lighting)
+	adap := gocv.NewMat()
+	gocv.AdaptiveThreshold(gray, &adap, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
+	if s := try(adap, "adaptive"); s != "" {
+		adap.Close()
+		return s
+	}
+
+	// 8) Inverted adaptive
+	adinv := gocv.NewMat()
+	gocv.BitwiseNot(adap, &adinv)
+	if s := try(adinv, "adaptive_inverted"); s != "" {
+		adinv.Close()
+		adap.Close()
+		return s
+	}
+	adinv.Close()
+	adap.Close()
+
+	return ""
 }
 
 func tryDecode(src image.Image) (string, image.Rectangle) {
@@ -618,16 +690,11 @@ func addRotations(src gocv.Mat, tag string, add func(gocv.Mat, string), toClose 
 }
 
 // cropImage crops the source image to the specified rectangle.
-func cropImage(img image.Image, rect image.Rectangle) image.Image {
-	if img == nil || rect.Empty() {
-		return img
+func cropImage(src image.Image, r image.Rectangle) image.Image {
+	if r.Dx() <= 0 || r.Dy() <= 0 {
+		return src
 	}
-	rect = rect.Intersect(img.Bounds())
-	if rect.Empty() {
-		return img
-	}
-
-	cropped := image.NewRGBA(rect)
-	draw.Draw(cropped, rect, img, rect.Min, draw.Src)
-	return cropped
+	rgba := image.NewRGBA(r)
+	draw.Draw(rgba, r, src, r.Min, draw.Src)
+	return rgba
 }

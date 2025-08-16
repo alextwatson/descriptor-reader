@@ -17,8 +17,6 @@ const (
 	NodeOr
 	NodeUnknown
 	NodeWsh
-	NodeTr
-	NodeXpub
 )
 
 type Node struct {
@@ -44,17 +42,11 @@ func Parse(expr string) (*Node, error) {
 	}
 	if strings.HasPrefix(expr, "tr(") {
 		inner := inside(expr)
-		// Taproot can contain multiple args (key + script tree)
-		args := splitArgs(inner)
-		children := []*Node{}
-		for _, a := range args {
-			child, err := Parse(a)
-			if err != nil {
-				return nil, err
-			}
-			children = append(children, child)
+		child, err := Parse(inner)
+		if err != nil {
+			return nil, err
 		}
-		return &Node{Type: NodeTr, Children: children}, nil
+		return &Node{Type: NodeWsh, Children: []*Node{child}}, nil
 	}
 	if strings.HasPrefix(expr, "multi(") {
 		args := splitArgs(inside(expr))
@@ -101,12 +93,8 @@ func Parse(expr string) (*Node, error) {
 		right, _ := Parse(args[1])
 		return &Node{Type: NodeOr, Children: []*Node{left, right}}, nil
 	}
-	if strings.HasPrefix(expr, "v:") {
-		inner := expr[2:]
-		return Parse(inner)
-	}
-	if strings.Contains(expr, "xpub") || strings.Contains(expr, "tpub") {
-		return &Node{Type: NodeXpub, Value: expr}, nil
+	if strings.HasPrefix(expr, "v:pk(") {
+		return &Node{Type: NodePk, Value: inside(expr)}, nil
 	}
 
 	return &Node{Type: NodeUnknown, Value: expr}, nil
@@ -185,7 +173,7 @@ func Explain(n *Node) string {
 		return fmt.Sprintf("only after %s blocks", n.Value)
 
 	case NodeMulti:
-		return fmt.Sprintf("a %s-of-%d multisig", n.Value, len(n.Children))
+		return fmt.Sprintf("requires %s signatures out of %d keys", n.Value, len(n.Children))
 
 	case NodeAnd:
 		return fmt.Sprintf("requires BOTH (%s) AND (%s)", Explain(n.Children[0]), Explain(n.Children[1]))
@@ -195,33 +183,6 @@ func Explain(n *Node) string {
 
 	case NodeWsh:
 		return fmt.Sprintf("SegWit v0 script: %s", Explain(n.Children[0]))
-
-	case NodeTr:
-		if len(n.Children) == 1 {
-			return fmt.Sprintf("Taproot key path spend:\n%s", Explain(n.Children[0]))
-		}
-
-		parts := []string{}
-		for _, c := range n.Children {
-			child := Explain(c)
-			parts = append(parts, "- "+child)
-		}
-
-		return fmt.Sprintf("Taproot script path spend with %d options:\n%s", len(n.Children), strings.Join(parts, "\n"))
-
-	case NodeXpub:
-		desc := n.Value
-		fp := ""
-		if strings.HasPrefix(desc, "[") {
-			end := strings.Index(desc, "]")
-			if end > 0 {
-				fp = desc[1:end] // fingerprint + path
-			}
-		}
-		if fp != "" {
-			return fmt.Sprintf("key at %s", fp)
-		}
-		return "extended public key"
 
 	default:
 		return "unrecognized miniscript"

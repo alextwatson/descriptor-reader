@@ -101,9 +101,8 @@ func Parse(expr string) (*Node, error) {
 		right, _ := Parse(args[1])
 		return &Node{Type: NodeOr, Children: []*Node{left, right}}, nil
 	}
-	if strings.HasPrefix(expr, "v:") {
-		inner := expr[2:]
-		return Parse(inner)
+	if strings.HasPrefix(expr, "v:pk(") {
+		return &Node{Type: NodePk, Value: inside(expr)}, nil
 	}
 	if strings.Contains(expr, "xpub") || strings.Contains(expr, "tpub") {
 		return &Node{Type: NodeXpub, Value: expr}, nil
@@ -185,7 +184,7 @@ func Explain(n *Node) string {
 		return fmt.Sprintf("only after %s blocks", n.Value)
 
 	case NodeMulti:
-		return fmt.Sprintf("a %s-of-%d multisig", n.Value, len(n.Children))
+		return fmt.Sprintf("requires %s signatures out of %d keys", n.Value, len(n.Children))
 
 	case NodeAnd:
 		return fmt.Sprintf("requires BOTH (%s) AND (%s)", Explain(n.Children[0]), Explain(n.Children[1]))
@@ -197,31 +196,14 @@ func Explain(n *Node) string {
 		return fmt.Sprintf("SegWit v0 script: %s", Explain(n.Children[0]))
 
 	case NodeTr:
-		if len(n.Children) == 1 {
-			return fmt.Sprintf("Taproot key path spend:\n%s", Explain(n.Children[0]))
-		}
-
 		parts := []string{}
 		for _, c := range n.Children {
-			child := Explain(c)
-			parts = append(parts, "- "+child)
+			parts = append(parts, Explain(c))
 		}
-
-		return fmt.Sprintf("Taproot script path spend with %d options:\n%s", len(n.Children), strings.Join(parts, "\n"))
+		return fmt.Sprintf("Taproot output with %d branches: %s", len(n.Children), strings.Join(parts, " AND/OR "))
 
 	case NodeXpub:
-		desc := n.Value
-		fp := ""
-		if strings.HasPrefix(desc, "[") {
-			end := strings.Index(desc, "]")
-			if end > 0 {
-				fp = desc[1:end] // fingerprint + path
-			}
-		}
-		if fp != "" {
-			return fmt.Sprintf("key at %s", fp)
-		}
-		return "extended public key"
+		return fmt.Sprintf("derived key from %s", n.Value)
 
 	default:
 		return "unrecognized miniscript"

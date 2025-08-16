@@ -179,7 +179,7 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 
 		content := container.NewVBox(qrImg, msg)
 		d := dialog.NewCustom("Type", "OK", content, w)
-		d.Resize(fyne.NewSize(450, 450))
+		d.Resize(fyne.NewSize(600, 600))
 		d.Show()
 
 		log.Printf(Explain(node))
@@ -252,7 +252,7 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 
 						content := container.NewVBox(qrImg, msg)
 						d := dialog.NewCustom("Type", "OK", content, w)
-						d.Resize(fyne.NewSize(450, 450))
+						d.Resize(fyne.NewSize(600, 600))
 						d.Show()
 					}
 					log.Printf(Explain(node))

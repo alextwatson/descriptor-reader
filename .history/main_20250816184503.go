@@ -169,18 +169,26 @@ func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
 		// crop QR region
 		cropped := cropImage(imgCopy, bounds)
 
+		// image widget
 		qrImg := canvas.NewImageFromImage(cropped)
 		qrImg.FillMode = canvas.ImageFillContain
-		qrImg.SetMinSize(fyne.NewSize(200, 200))
+		qrImg.SetMinSize(fyne.NewSize(300, 300)) // bigger so it's visible
 
+		// text widget
 		msg := widget.NewLabel(desc)
 		msg.Alignment = fyne.TextAlignLeading
 		msg.Wrapping = fyne.TextWrapWord
 
-		content := container.NewVBox(qrImg, msg)
-		d := dialog.NewCustom("Type", "OK", content, w)
-		d.Resize(fyne.NewSize(450, 450))
-		d.Show()
+		// stack vertically, but give them some space
+		content := container.NewVBox(
+			qrImg,
+			msg,
+		)
+
+		// wrap in a scroll or set min size so dialog isn’t skinny
+		content.Resize(fyne.NewSize(500, 500))
+
+		dialog.ShowCustom("Type", "OK", content, w)
 
 		log.Printf(Explain(node))
 		runOnMain(func() { output.SetText(payload) })
@@ -195,6 +203,7 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 	det := gocv.NewQRCodeDetector()
 	defer det.Close()
 	ticker := time.NewTicker(33 * time.Millisecond)
+	imgCopy := state.lastFrame
 	defer ticker.Stop()
 	for {
 		select {
@@ -239,22 +248,29 @@ func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, 
 					desc := Explain(node)
 
 					// crop QR region
-					if payload != "" && !bounds.Empty() && src != nil {
-						cropped := cropImage(src, bounds)
+					cropped := cropImage(imgCopy, bounds)
 
-						qrImg := canvas.NewImageFromImage(cropped)
-						qrImg.FillMode = canvas.ImageFillContain
-						qrImg.SetMinSize(fyne.NewSize(200, 200))
+					// image widget
+					qrImg := canvas.NewImageFromImage(cropped)
+					qrImg.FillMode = canvas.ImageFillContain
+					qrImg.SetMinSize(fyne.NewSize(300, 300)) // bigger so it's visible
 
-						msg := widget.NewLabel(desc)
-						msg.Alignment = fyne.TextAlignLeading
-						msg.Wrapping = fyne.TextWrapWord
+					// text widget
+					msg := widget.NewLabel(desc)
+					msg.Alignment = fyne.TextAlignLeading
+					msg.Wrapping = fyne.TextWrapWord
 
-						content := container.NewVBox(qrImg, msg)
-						d := dialog.NewCustom("Type", "OK", content, w)
-						d.Resize(fyne.NewSize(450, 450))
-						d.Show()
-					}
+					// stack vertically, but give them some space
+					content := container.NewVBox(
+						qrImg,
+						msg,
+					)
+
+					// wrap in a scroll or set min size so dialog isn’t skinny
+					content.Resize(fyne.NewSize(500, 500))
+
+					dialog.ShowCustom("Type", "OK", content, w)
+
 					log.Printf(Explain(node))
 
 					state.mu.Lock()
@@ -618,16 +634,11 @@ func addRotations(src gocv.Mat, tag string, add func(gocv.Mat, string), toClose 
 }
 
 // cropImage crops the source image to the specified rectangle.
-func cropImage(img image.Image, rect image.Rectangle) image.Image {
-	if img == nil || rect.Empty() {
-		return img
+func cropImage(src image.Image, r image.Rectangle) image.Image {
+	if r.Dx() <= 0 || r.Dy() <= 0 {
+		return src
 	}
-	rect = rect.Intersect(img.Bounds())
-	if rect.Empty() {
-		return img
-	}
-
-	cropped := image.NewRGBA(rect)
-	draw.Draw(cropped, rect, img, rect.Min, draw.Src)
-	return cropped
+	rgba := image.NewRGBA(r)
+	draw.Draw(rgba, r, src, r.Min, draw.Src)
+	return rgba
 }

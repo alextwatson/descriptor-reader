@@ -198,16 +198,13 @@ func Explain(n *Node) string {
 
 	case NodeTr:
 		if len(n.Children) == 1 {
-			return fmt.Sprintf("Taproot key path spend:\n%s", Explain(n.Children[0]))
+			return fmt.Sprintf("Taproot key path spend: %s", Explain(n.Children[0]))
 		}
-
 		parts := []string{}
 		for _, c := range n.Children {
-			child := Explain(c)
-			parts = append(parts, "- "+child)
+			parts = append(parts, Explain(c))
 		}
-
-		return fmt.Sprintf("Taproot script path spend with %d options:\n%s", len(n.Children), strings.Join(parts, "\n"))
+		return fmt.Sprintf("Taproot script path spend with %d options: %s", len(n.Children), strings.Join(parts, " ; "))
 
 	case NodeXpub:
 		desc := n.Value
