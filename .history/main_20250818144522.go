@@ -19,7 +19,6 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/liyue201/goqr"
@@ -57,7 +56,7 @@ func main() {
 
 	state := &uiState{}
 	// Open the webcam
-	webcam, _, err := openFirstWorkingCamera()
+	webcam, err := gocv.OpenVideoCapture(0)
 	if err != nil {
 		dialog.ShowError(fmt.Errorf("open camera: %w", err), w)
 	} else {
@@ -84,6 +83,16 @@ func main() {
 		go runPreview(ctx, webcam, img, output, state, w)
 	}
 
+	pauseBtn := widget.NewButton("Pause Preview", func() {
+		state.mu.Lock()
+		state.paused = true
+		state.mu.Unlock()
+	})
+
+	scanPausedBtn := widget.NewButton("Scan Paused Frame", func() {
+		scanPausedFrame(state, output, w)
+	})
+
 	resetBtn := widget.NewButton("Reset", func() {
 		output.SetText("")
 		state.mu.Lock()
@@ -93,34 +102,92 @@ func main() {
 		startPreview()
 	})
 
+	w.Canvas().SetOnTypedKey(func(k *fyne.KeyEvent) {
+		switch k.Name {
+		case fyne.KeySpace:
+			state.mu.Lock()
+			if state.paused {
+				state.paused = false
+				state.mu.Unlock()
+			} else {
+				state.paused = true
+				state.mu.Unlock()
+				scanPausedFrame(state, output, w)
+			}
+
+		}
+	})
+
 	copyBtn := widget.NewButton("Copy", func() {
 		w.Clipboard().SetContent(output.Text)
 	})
 
-	// Buttons row (centered horizontally)
-	buttons := container.NewHBox(
-		layout.NewSpacer(),
-		resetBtn,
-		copyBtn,
-		layout.NewSpacer(),
-	)
-
-	// Split the lower area into text + buttons
-	lowerSplit := container.NewVSplit(output, buttons)
-	lowerSplit.SetOffset(0.66) // 2/3 text, 1/3 buttons in bottom area
-
-	// Split whole window into video (top) + lower area
-	mainSplit := container.NewVSplit(img, lowerSplit)
-	mainSplit.SetOffset(0.7) // 70% video, 30% bottom
-
-	// Set content to the main split
-	w.SetContent(mainSplit)
+	// Layout the UI components
+	controls := container.NewVBox(pauseBtn, scanPausedBtn, resetBtn, copyBtn)
+	w.SetContent(container.NewBorder(nil, output, controls, nil, img))
 
 	startPreview()
 	w.ShowAndRun()
 }
 
 // scanPausedFrame processes the currently paused frame for QR codes
+func scanPausedFrame(state *uiState, output *widget.Entry, w fyne.Window) {
+	state.mu.Lock()
+	imgCopy := state.lastFrame
+	state.mu.Unlock()
+	if imgCopy == nil {
+		dialog.ShowInformation("Scan", "No paused frame yet.", w)
+		return
+	}
+
+	// Convert paused frame to Mat once
+	mat, err := gocv.ImageToMatRGB(imgCopy)
+	if err != nil {
+		log.Printf("ImageToMatRGB err: %v", err)
+		dialog.ShowInformation("Scan", "Could not convert frame.", w)
+		return
+	}
+	defer mat.Close()
+
+	// Do an in-depth corner-first sweep on the paused frame
+	payload, bounds := deepDetectAndDecode(mat)
+	log.Printf("deep detect FINISH")
+
+	if payload == "" {
+		dialog.ShowInformation("Scan", "No QR detected in paused frame.", w)
+		return
+	}
+	if IsLikelyDescriptor(payload) {
+		node, err := Parse(payload)
+		if err != nil {
+			fmt.Println("Parse error:", err)
+			dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
+		}
+
+		desc := Explain(node)
+
+		// crop QR region
+		cropped := cropImage(imgCopy, bounds)
+
+		qrImg := canvas.NewImageFromImage(cropped)
+		qrImg.FillMode = canvas.ImageFillContain
+		qrImg.SetMinSize(fyne.NewSize(200, 200))
+
+		msg := widget.NewLabel(desc)
+		msg.Alignment = fyne.TextAlignLeading
+		msg.Wrapping = fyne.TextWrapWord
+
+		content := container.NewVBox(qrImg, msg)
+		d := dialog.NewCustom("Type", "OK", content, w)
+		d.Resize(fyne.NewSize(450, 450))
+		d.Show()
+
+		log.Printf(Explain(node))
+		runOnMain(func() { output.SetText(payload) })
+	} else {
+		dialog.ShowInformation("Scan", "QR detected, but it's not a Bitcoin output descriptor.", w)
+	}
+}
 
 func runPreview(ctx context.Context, cam *gocv.VideoCapture, img *canvas.Image, out *widget.Entry, state *uiState, w fyne.Window) {
 	frame := gocv.NewMat()
@@ -371,6 +438,168 @@ func IsLikelyDescriptor(s string) bool {
 		}
 	}
 	return bal == 0
+}
+
+// deepDetectAndDecode performs an exhaustive search for QR codes in the given Mat.
+func deepDetectAndDecode(m gocv.Mat) (string, image.Rectangle) {
+	log.Printf("deep detect START")
+	det := gocv.NewQRCodeDetector()
+	defer det.Close()
+
+	type variant struct {
+		M   gocv.Mat
+		tag string
+	}
+	variants := make([]variant, 0, 12)
+	add := func(mat gocv.Mat, tag string) { variants = append(variants, variant{M: mat, tag: tag}) }
+
+	// We'll close everything we allocate here (but NOT the original m)
+	toClose := []gocv.Mat{}
+
+	// Base variants
+	add(m, "raw")
+
+	gray := gocv.NewMat()
+	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
+	add(gray, "gray")
+	toClose = append(toClose, gray)
+
+	eq := gocv.NewMat()
+	gocv.EqualizeHist(gray, &eq)
+	add(eq, "equalize")
+	toClose = append(toClose, eq)
+
+	ginv := gocv.NewMat()
+	gocv.BitwiseNot(gray, &ginv)
+	add(ginv, "gray_inverted")
+	toClose = append(toClose, ginv)
+
+	bin := gocv.NewMat()
+	gocv.Threshold(gray, &bin, 0, 255, gocv.ThresholdBinary|gocv.ThresholdOtsu)
+	add(bin, "otsu")
+	toClose = append(toClose, bin)
+
+	inv := gocv.NewMat()
+	gocv.BitwiseNot(bin, &inv)
+	add(inv, "otsu_inverted")
+	toClose = append(toClose, inv)
+
+	// (4) Adaptive-threshold grid search (block sizes × C), plus inverted forms
+	for _, bs := range []int{15, 21, 31, 41} {
+		for _, C := range []float32{2, 5, 8} {
+			at := gocv.NewMat()
+			gocv.AdaptiveThreshold(gray, &at, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, bs, C)
+			add(at, fmt.Sprintf("adapt_b%d_c%.0f", bs, C))
+			toClose = append(toClose, at)
+
+			atInv := gocv.NewMat()
+			gocv.BitwiseNot(at, &atInv)
+			add(atInv, fmt.Sprintf("adapt_b%d_c%.0f_inv", bs, C))
+			toClose = append(toClose, atInv)
+		}
+	}
+
+	// (1) Rotation sweep on a few *representative* variants (keeps variant count sane)
+	addRotations(gray, "gray", add, &toClose)
+	addRotations(eq, "equalize", add, &toClose)
+	// Also rotate one “typical” adaptive combo (31,5) and its inverse
+	{
+		at := gocv.NewMat()
+		gocv.AdaptiveThreshold(gray, &at, 255, gocv.AdaptiveThresholdGaussian, gocv.ThresholdBinary, 31, 5)
+		addRotations(at, "adapt_b31_c5", add, &toClose)
+		toClose = append(toClose, at)
+
+		atInv := gocv.NewMat()
+		gocv.BitwiseNot(at, &atInv)
+		addRotations(atInv, "adapt_b31_c5_inv", add, &toClose)
+		toClose = append(toClose, atInv)
+	}
+
+	// Edge-preserving upscales for small frames (helps tiny modules)
+	if m.Cols() < 1400 {
+		base := append([]variant(nil), variants...) // copy current list
+		for _, v := range base {
+			up := gocv.NewMat()
+			newW := 1600
+			newH := int(float64(v.M.Rows()) * float64(newW) / float64(v.M.Cols()))
+			gocv.Resize(v.M, &up, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+			add(up, v.tag+"+nnx")
+			toClose = append(toClose, up)
+		}
+		// Rotate the upscaled gray as well (cheap + very effective)
+		if len(gray.ToBytes()) > 0 { // guard: ensure gray is valid
+			upg := gocv.NewMat()
+			newW := 1600
+			newH := int(float64(gray.Rows()) * float64(newW) / float64(gray.Cols()))
+			gocv.Resize(gray, &upg, image.Pt(newW, newH), 0, 0, gocv.InterpolationNearestNeighbor)
+			addRotations(upg, "gray+nnx", add, &toClose)
+			toClose = append(toClose, upg)
+		}
+	}
+
+	// Try each variant: OpenCV decode, then rectified salvage via goqr
+	for _, v := range variants {
+		pts := gocv.NewMat()
+		straight := gocv.NewMat()
+		s := det.DetectAndDecode(v.M, &pts, &straight)
+
+		if s != "" {
+			log.Printf("QR hit via %s", v.tag)
+			rect := image.Rectangle{}
+			if !pts.Empty() {
+				arr, _ := pts.DataPtrFloat32()
+				if len(arr) >= 8 {
+					// take min/max of 4 corners
+					minX, minY := int(arr[0]), int(arr[1])
+					maxX, maxY := minX, minY
+					for i := 2; i < 8; i += 2 {
+						x, y := int(arr[i]), int(arr[i+1])
+						if x < minX {
+							minX = x
+						}
+						if y < minY {
+							minY = y
+						}
+						if x > maxX {
+							maxX = x
+						}
+						if y > maxY {
+							maxY = y
+						}
+					}
+					rect = image.Rect(minX, minY, maxX, maxY)
+				}
+			}
+			pts.Close()
+			straight.Close()
+			for _, c := range toClose {
+				c.Close()
+			}
+			return s, rect
+		}
+
+		if !pts.Empty() && !straight.Empty() {
+			if img := matToImage(straight); img != nil {
+				if codes, err := goqr.Recognize(img); err == nil && len(codes) > 0 {
+					s2 := string(codes[0].Payload)
+					log.Printf("QR rectified+goqr hit via %s", v.tag)
+					pts.Close()
+					straight.Close()
+					for _, c := range toClose {
+						c.Close()
+					}
+					return s2, image.Rectangle{}
+				}
+			}
+		}
+		pts.Close()
+		straight.Close()
+	}
+
+	for _, c := range toClose {
+		c.Close()
+	}
+	return "", image.Rectangle{}
 }
 
 // addRotations creates rotated variants of src at several angles and registers them via add.

@@ -14,12 +14,12 @@ import (
 	"sync"
 	"time"
 
+	"fyne.io/fyne/layout"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/liyue201/goqr"
@@ -97,24 +97,41 @@ func main() {
 		w.Clipboard().SetContent(output.Text)
 	})
 
-	// Buttons row (centered horizontally)
-	buttons := container.NewHBox(
-		layout.NewSpacer(),
-		resetBtn,
-		copyBtn,
-		layout.NewSpacer(),
+	// Layout the UI components
+	// Main vertical layout
+	mainContent := container.NewVBox(
+		// Video preview (big)
+		container.NewMax(img),
+
+		// Descriptor text (multi-line entry)
+		output,
+
+		// Buttons (horizontally centered)
+		container.NewHBox(
+			layout.NewSpacer(),
+			resetBtn,
+			copyBtn,
+			layout.NewSpacer(),
+		),
 	)
 
-	// Split the lower area into text + buttons
-	lowerSplit := container.NewVSplit(output, buttons)
-	lowerSplit.SetOffset(0.66) // 2/3 text, 1/3 buttons in bottom area
+	// Assign proportions with split container
+	content := container.NewVSplit(
+		img,
+		container.NewVSplit(
+			output,
+			container.NewHBox(
+				layout.NewSpacer(),
+				resetBtn,
+				copyBtn,
+				layout.NewSpacer(),
+			),
+		),
+	)
+	content.SetOffset(0.7)                                                         // 70% video, 30% for bottom split
+	content.Bottom.(*fyne.Container).Objects[0].(*container.Split).SetOffset(0.66) // ~20% text, ~10% buttons
 
-	// Split whole window into video (top) + lower area
-	mainSplit := container.NewVSplit(img, lowerSplit)
-	mainSplit.SetOffset(0.7) // 70% video, 30% bottom
-
-	// Set content to the main split
-	w.SetContent(mainSplit)
+	w.SetContent(content)
 
 	startPreview()
 	w.ShowAndRun()

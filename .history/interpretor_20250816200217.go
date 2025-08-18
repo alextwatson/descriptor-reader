@@ -188,7 +188,7 @@ func Explain(n *Node) string {
 		return fmt.Sprintf("a %s-of-%d multisig", n.Value, len(n.Children))
 
 	case NodeAnd:
-		return fmt.Sprintf("%s\nAND\n%s", Explain(n.Children[0]), Explain(n.Children[1]))
+		return fmt.Sprintf("requires BOTH (%s) AND (%s)", Explain(n.Children[0]), Explain(n.Children[1]))
 
 	case NodeOr:
 		return fmt.Sprintf("can be spent by EITHER (%s) OR (%s)", Explain(n.Children[0]), Explain(n.Children[1]))
