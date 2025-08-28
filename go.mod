@@ -1,10 +1,11 @@
 module descriptor-reader
 
-go 1.20
+go 1.21
+
+toolchain go1.23.1
 
 require (
 	fyne.io/fyne/v2 v2.6.2
-	github.com/liyue201/goqr v0.0.0-20200803022322-df443203d4ea
 	gocv.io/x/gocv v0.42.0
 )
 
