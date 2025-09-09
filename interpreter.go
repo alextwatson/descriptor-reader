@@ -88,8 +88,14 @@ func Parse(expr string) (*Node, error) {
 		if len(args) != 2 {
 			return nil, fmt.Errorf("and_v must have 2 args")
 		}
-		left, _ := Parse(args[0])
-		right, _ := Parse(args[1])
+		left, err := Parse(args[0])
+		if err != nil {
+			return nil, fmt.Errorf("and_v left arg: %w", err)
+		}
+		right, err := Parse(args[1])
+		if err != nil {
+			return nil, fmt.Errorf("and_v right arg: %w", err)
+		}
 		return &Node{Type: NodeAnd, Children: []*Node{left, right}}, nil
 	}
 	if strings.HasPrefix(expr, "or_d(") {
@@ -97,8 +103,14 @@ func Parse(expr string) (*Node, error) {
 		if len(args) != 2 {
 			return nil, fmt.Errorf("or_d must have 2 args")
 		}
-		left, _ := Parse(args[0])
-		right, _ := Parse(args[1])
+		left, err := Parse(args[0])
+		if err != nil {
+			return nil, fmt.Errorf("or_d left arg: %w", err)
+		}
+		right, err := Parse(args[1])
+		if err != nil {
+			return nil, fmt.Errorf("or_d right arg: %w", err)
+		}
 		return &Node{Type: NodeOr, Children: []*Node{left, right}}, nil
 	}
 	if strings.HasPrefix(expr, "v:") {

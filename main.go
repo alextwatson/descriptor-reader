@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
-	"image/png"
 	"log"
 	"regexp"
 	"strings"
@@ -35,6 +33,7 @@ type uiState struct {
 	detected   bool
 	lastFrame  image.Image
 	cancelPrev context.CancelFunc
+	frameRate  time.Duration // configurable frame rate
 }
 
 type historyItem struct {
@@ -65,7 +64,9 @@ func main() {
 	output.Wrapping = fyne.TextWrapWord
 	output.TextStyle = fyne.TextStyle{Monospace: true} // monospace for readability
 
-	state := &uiState{}
+	state := &uiState{
+		frameRate: 33 * time.Millisecond, // default 30fps, configurable
+	}
 
 	// History store + list widget
 	var histMu sync.Mutex
@@ -235,10 +236,15 @@ func runPreview(
 ) {
 	frame := gocv.NewMat()
 	defer frame.Close()
+
+	// Reuse one detector
 	det := gocv.NewQRCodeDetector()
 	defer det.Close()
 
-	ticker := time.NewTicker(33 * time.Millisecond)
+	state.mu.Lock()
+	frameRate := state.frameRate
+	state.mu.Unlock()
+	ticker := time.NewTicker(frameRate)
 	defer ticker.Stop()
 
 	for {
@@ -263,35 +269,36 @@ func runPreview(
 			if ok := cam.Read(&frame); !ok || frame.Empty() {
 				continue
 			}
-			flipped := gocv.NewMat()
-			gocv.Flip(frame, &flipped, 1)
-			frame = flipped
 
-			src := matToImage(frame)
-			if src == nil {
-				continue
-			}
+			// --- Preview frame (mirrored for user UI) ---
+			previewFrame := gocv.NewMat()
+			gocv.Flip(frame, &previewFrame, 1)
+
+			src := matToImage(previewFrame)
+
+			previewFrame.Close()
+
 			state.mu.Lock()
 			state.lastFrame = src
 			state.mu.Unlock()
 
-			payload, bounds := quickDetect(frame)
+			// --- Detection uses raw (non-flipped) frame ---
+			payload, bounds := quickDetect(det, frame)
+
 			if payload != "" {
-				log.Printf("payload != \"\"")
-				if IsLikelyDescriptor(payload) { // :contentReference[oaicite:2]{index=2}
+				log.Printf("payload detected: %q", payload)
+
+				if IsLikelyDescriptor(payload) {
 					log.Printf("is a descriptor")
 
-					// Parse + explain
 					desc := ""
-					if node, err := Parse(payload); err == nil { // :contentReference[oaicite:3]{index=3}
-						desc = Explain(node) // :contentReference[oaicite:4]{index=4}
+					if node, err := Parse(payload); err == nil {
+						desc = Explain(node)
 					} else {
-						fmt.Println("Parse error:", err)
 						desc = "QR detected, but descriptor parse error."
-						dialog.ShowInformation("Type", "QR detected, but descriptor parse error.", w)
+						dialog.ShowInformation("Type", desc, w)
 					}
 
-					// crop QR region dialog (nice UX)
 					if !bounds.Empty() && src != nil {
 						cropped := cropImage(src, bounds)
 						qrImg := canvas.NewImageFromImage(cropped)
@@ -308,7 +315,6 @@ func runPreview(
 						d.Show()
 					}
 
-					// Stop this preview loop
 					state.mu.Lock()
 					if state.cancelPrev != nil {
 						state.cancelPrev()
@@ -325,84 +331,304 @@ func runPreview(
 						out.SetText(payload)
 					})
 
-					// record in history
 					if onHit != nil {
 						onHit(payload, desc)
 					}
 					return
 				} else {
-					log.Printf("not a descriptor")
+					log.Printf("not a descriptor, payload=%q", payload)
+					// Add non-descriptor QR codes to history
+					if onHit != nil {
+						onHit(payload, "QR code detected (not a Bitcoin descriptor)")
+					}
 				}
 			}
+
 			runOnMain(func() { img.Image = drawGuideBox(src); img.Refresh() })
 		}
 	}
 }
 
-func quickDetect(m gocv.Mat) (string, image.Rectangle) {
-	det := gocv.NewQRCodeDetector()
-	defer det.Close()
-
-	pts := gocv.NewMat()
-	straight := gocv.NewMat()
-	defer pts.Close()
-	defer straight.Close()
-
-	s := det.DetectAndDecode(m, &pts, &straight)
-	if s == "" {
-		return "", image.Rectangle{}
+// quickDetect: more robust (multi + single + preprocessing)
+// quickDetect: robust path (multi first, then single) for your GoCV version.
+func quickDetect(det gocv.QRCodeDetector, m gocv.Mat) (string, image.Rectangle) {
+	gray := gocv.NewMat()
+	defer gray.Close()
+	gocv.CvtColor(m, &gray, gocv.ColorBGRToGray)
+	
+	// Create preprocessing variations optimized for different QR code types
+	preprocessedImages := []gocv.Mat{}
+	
+	// Add standard approaches
+	preprocessedImages = append(preprocessedImages, 
+		// 1. Histogram equalization (original approach)
+		func() gocv.Mat {
+			hist := gocv.NewMat()
+			gocv.EqualizeHist(gray, &hist)
+			return hist
+		}(),
+		// 2. Adaptive thresholding - standard
+		func() gocv.Mat {
+			adaptive := gocv.NewMat()
+			gocv.AdaptiveThreshold(gray, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 11, 2)
+			return adaptive
+		}(),
+		// 3. Adaptive thresholding - fine details (for dense QR codes)
+		func() gocv.Mat {
+			adaptive := gocv.NewMat()
+			gocv.AdaptiveThreshold(gray, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 7, 3)
+			return adaptive
+		}(),
+		// 4. Sharpened with Gaussian blur reduction
+		func() gocv.Mat {
+			blurred := gocv.NewMat()
+			defer blurred.Close()
+			gocv.GaussianBlur(gray, &blurred, image.Pt(3, 3), 0, 0, gocv.BorderDefault)
+			sharpened := gocv.NewMat()
+			gocv.AddWeighted(gray, 1.5, blurred, -0.5, 0, &sharpened)
+			return sharpened
+		}(),
+		// 5. Morphological operations for noise cleanup
+		func() gocv.Mat {
+			kernel := gocv.GetStructuringElement(gocv.MorphEllipse, image.Pt(2, 2))
+			defer kernel.Close()
+			opened := gocv.NewMat()
+			gocv.MorphologyEx(gray, &opened, gocv.MorphOpen, kernel)
+			return opened
+		}(),
+		// 6. Enhanced contrast using CLAHE (Contrast Limited Adaptive Histogram Equalization)
+		func() gocv.Mat {
+			clahe := gocv.NewCLAHEWithParams(2.0, image.Pt(8, 8))
+			defer clahe.Close()
+			enhanced := gocv.NewMat()
+			clahe.Apply(gray, &enhanced)
+			return enhanced
+		}(),
+		// 7. Gamma correction for low contrast - use simple brightness/contrast adjustment
+		func() gocv.Mat {
+			gamma := gocv.NewMat()
+			gray.ConvertTo(&gamma, gocv.MatTypeCV8U)
+			// Brighten the image
+			gocv.ConvertScaleAbs(gamma, &gamma, 1.2, 30)
+			return gamma
+		}(),
+	)
+	
+	// Add inverted versions
+	preprocessedImages = append(preprocessedImages,
+		// 6. Inverted histogram equalization
+		func() gocv.Mat {
+			inverted := gocv.NewMat()
+			defer inverted.Close()
+			gocv.BitwiseNot(gray, &inverted)
+			hist := gocv.NewMat()
+			gocv.EqualizeHist(inverted, &hist)
+			return hist
+		}(),
+		// 7. Inverted adaptive thresholding - standard
+		func() gocv.Mat {
+			inverted := gocv.NewMat()
+			defer inverted.Close()
+			gocv.BitwiseNot(gray, &inverted)
+			adaptive := gocv.NewMat()
+			gocv.AdaptiveThreshold(inverted, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 11, 2)
+			return adaptive
+		}(),
+		// 8. Inverted adaptive thresholding - fine details
+		func() gocv.Mat {
+			inverted := gocv.NewMat()
+			defer inverted.Close()
+			gocv.BitwiseNot(gray, &inverted)
+			adaptive := gocv.NewMat()
+			gocv.AdaptiveThreshold(inverted, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 7, 3)
+			return adaptive
+		}(),
+	)
+	
+	// ROI detection - try to focus on rectangular paper-like regions
+	rois := detectPaperRegions(gray)
+	for _, roi := range rois {
+		roiMat := gray.Region(roi)
+		defer roiMat.Close()
+		
+		// Apply basic preprocessing to ROI
+		preprocessedImages = append(preprocessedImages,
+			// ROI histogram equalization
+			func() gocv.Mat {
+				hist := gocv.NewMat()
+				gocv.EqualizeHist(roiMat, &hist)
+				return hist
+			}(),
+			// ROI adaptive threshold
+			func() gocv.Mat {
+				adaptive := gocv.NewMat()
+				gocv.AdaptiveThreshold(roiMat, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, 11, 2)
+				return adaptive
+			}(),
+		)
 	}
-
-	rect := image.Rectangle{}
-	if !pts.Empty() {
-		arr, _ := pts.DataPtrFloat32()
-		if len(arr) >= 8 {
-			minX, minY := int(arr[0]), int(arr[1])
-			maxX, maxY := minX, minY
-			for i := 2; i < 8; i += 2 {
-				x, y := int(arr[i]), int(arr[i+1])
-				if x < minX {
-					minX = x
-				}
-				if y < minY {
-					minY = y
-				}
-				if x > maxX {
-					maxX = x
-				}
-				if y > maxY {
-					maxY = y
-				}
-			}
-			rect = image.Rect(minX, minY, maxX, maxY)
+	
+	// Multi-scale detection - try different image sizes (simplified)
+	scales := []float64{1.0, 1.2, 0.8, 1.5}
+	for _, scale := range scales {
+		if scale != 1.0 {
+			resized := gocv.NewMat()
+			newSize := image.Pt(int(float64(gray.Cols())*scale), int(float64(gray.Rows())*scale))
+			gocv.Resize(gray, &resized, newSize, 0, 0, gocv.InterpolationLinear)
+			
+			// Add scaled versions with basic preprocessing
+			preprocessedImages = append(preprocessedImages,
+				// Scaled histogram equalization
+				func() gocv.Mat {
+					hist := gocv.NewMat()
+					gocv.EqualizeHist(resized, &hist)
+					return hist
+				}(),
+				// Scaled adaptive threshold
+				func() gocv.Mat {
+					adaptive := gocv.NewMat()
+					blockSize := int(11.0 / scale)
+					if blockSize%2 == 0 {
+						blockSize++
+					}
+					if blockSize < 3 {
+						blockSize = 3
+					}
+					gocv.AdaptiveThreshold(resized, &adaptive, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinary, blockSize, 2)
+					return adaptive
+				}(),
+			)
+			resized.Close()
 		}
 	}
+	
+	defer func() {
+		for _, img := range preprocessedImages {
+			img.Close()
+		}
+	}()
+	
+	// Try detection on each preprocessed image
+	for _, processedImg := range preprocessedImages {
+		pointsMulti := gocv.NewMat()
+		defer pointsMulti.Close()
+		var straightMulti []gocv.Mat
+		defer func() {
+			for _, mat := range straightMulti {
+				mat.Close()
+			}
+		}()
+		decoded := make([]string, 10)
 
-	return s, rect
+		ok := det.DetectAndDecodeMulti(processedImg, decoded, &pointsMulti, straightMulti)
+		if ok {
+			for i, s := range decoded {
+				if s != "" {
+					return s, rectFromMultiPoints(pointsMulti, i)
+				}
+			}
+		}
+
+		// Fallback to single detection
+		pts := gocv.NewMat()
+		straight := gocv.NewMat()
+		defer pts.Close()
+		defer straight.Close()
+
+		s := det.DetectAndDecode(processedImg, &pts, &straight)
+		if s != "" {
+			return s, rectFromSinglePoints(pts)
+		}
+	}
+	
+	return "", image.Rectangle{}
 }
+
+// Build a bounding rect from the "multi" points Mat (8 floats per QR: x0,y0,...,x3,y3)
+func rectFromMultiPoints(points gocv.Mat, idx int) image.Rectangle {
+	if points.Empty() {
+		return image.Rectangle{}
+	}
+	arr, _ := points.DataPtrFloat32()
+	// Expect 8 floats per code (4 corners)
+	offset := 8 * idx
+	if len(arr) < offset+8 {
+		return image.Rectangle{}
+	}
+	minX, minY := int(arr[offset]), int(arr[offset+1])
+	maxX, maxY := minX, minY
+	for i := 2; i < 8; i += 2 {
+		x, y := int(arr[offset+i]), int(arr[offset+i+1])
+		if x < minX {
+			minX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	return image.Rect(minX, minY, maxX, maxY)
+}
+
+// Build a bounding rect from the "single" points Mat (8 floats: x0,y0,...,x3,y3)
+func rectFromSinglePoints(pts gocv.Mat) image.Rectangle {
+	if pts.Empty() {
+		return image.Rectangle{}
+	}
+	arr, _ := pts.DataPtrFloat32()
+	if len(arr) < 8 {
+		return image.Rectangle{}
+	}
+	minX, minY := int(arr[0]), int(arr[1])
+	maxX, maxY := minX, minY
+	for i := 2; i < 8; i += 2 {
+		x, y := int(arr[i]), int(arr[i+1])
+		if x < minX {
+			minX = x
+		}
+		if y < minY {
+			minY = y
+		}
+		if x > maxX {
+			maxX = x
+		}
+		if y > maxY {
+			maxY = y
+		}
+	}
+	return image.Rect(minX, minY, maxX, maxY)
+}
+
+// rectFromCorners builds a bounding rect from multi-detect points
+
+// rectFromPts builds a bounding rect from single-detect points
 
 func matToImage(m gocv.Mat) image.Image {
 	if m.Empty() {
 		return nil
 	}
 	bgra := gocv.NewMat()
+	defer bgra.Close()
 	gocv.CvtColor(m, &bgra, gocv.ColorBGRToBGRA)
-	nbuf, err := gocv.IMEncode(".png", bgra)
-	if err != nil || nbuf == nil {
-		return nil
+	
+	// Direct conversion without PNG encoding/decoding
+	data := bgra.ToBytes()
+	bounds := image.Rect(0, 0, bgra.Cols(), bgra.Rows())
+	img := &image.RGBA{
+		Pix:    data,
+		Stride: 4 * bgra.Cols(),
+		Rect:   bounds,
 	}
-	defer nbuf.Close()
-
-	buf := nbuf.GetBytes()
-	if len(buf) == 0 {
-		return nil
-	}
-
-	img, err := png.Decode(bytes.NewReader(buf))
-	if err != nil {
-		return nil
-	}
-	return img
+	
+	// Copy data to avoid sharing memory with OpenCV
+	copyImg := image.NewRGBA(bounds)
+	copy(copyImg.Pix, img.Pix)
+	return copyImg
 }
 
 // drawBoundingBox draws a green bounding box around the specified rectangle on the source image.
@@ -462,10 +688,27 @@ var (
 	headRe     = regexp.MustCompile(`^(pkh|wpkh|sh|wsh|tr|combo)\(`)
 	hasKeyRe   = regexp.MustCompile(`(xpub|xprv|tpub|tprv|[023][0-9A-Fa-f]{6,})`)
 	checksumRe = regexp.MustCompile(`#[-a-z0-9]{8}$`)
+	aliasRe    = regexp.MustCompile(`@\d+=\[`) // Detect descriptor aliases like @1=[...]
 )
 
 func IsLikelyDescriptor(s string) bool {
 	s = strings.TrimSpace(s)
+	
+	// Check for descriptor aliases (like @1=[...] syntax)
+	hasAliases := aliasRe.MatchString(s)
+	
+	// For alias-based descriptors, look for the main descriptor part after semicolons
+	if hasAliases {
+		parts := strings.Split(s, ";")
+		if len(parts) < 2 {
+			return false
+		}
+		// Check the last part (should be the main descriptor)
+		mainDesc := parts[len(parts)-1]
+		return IsLikelyDescriptor(mainDesc) // Recursive check on the main part
+	}
+	
+	// Standard descriptor checks
 	if !headRe.MatchString(s) {
 		return false
 	}
@@ -478,6 +721,7 @@ func IsLikelyDescriptor(s string) bool {
 	if strings.Contains(s, "#") && !checksumRe.MatchString(s) {
 		return false
 	}
+	
 	// Basic paren balance check.
 	bal := 0
 	for _, r := range s {
@@ -510,6 +754,49 @@ func cropImage(img image.Image, rect image.Rectangle) image.Image {
 	cropped := image.NewRGBA(rect)
 	draw.Draw(cropped, rect, img, rect.Min, draw.Src)
 	return cropped
+}
+
+// detectPaperRegions finds rectangular regions that might contain QR codes
+func detectPaperRegions(gray gocv.Mat) []image.Rectangle {
+	regions := []image.Rectangle{}
+	
+	// Simple approach - divide image into regions and return center region
+	centerX := gray.Cols() / 2
+	centerY := gray.Rows() / 2
+	size := min(gray.Cols(), gray.Rows()) / 2
+	centerRect := image.Rect(
+		max(0, centerX-size/2),
+		max(0, centerY-size/2),
+		min(gray.Cols(), centerX+size/2),
+		min(gray.Rows(), centerY+size/2),
+	)
+	regions = append(regions, centerRect)
+	
+	return regions
+}
+
+// rotateImage rotates an image by the given angle (in degrees)
+func rotateImage(src gocv.Mat, angle float64) gocv.Mat {
+	if angle == 0 {
+		rotated := gocv.NewMat()
+		src.CopyTo(&rotated)
+		return rotated
+	}
+	
+	center := image.Pt(src.Cols()/2, src.Rows()/2)
+	rotMat := gocv.GetRotationMatrix2D(center, angle, 1.0)
+	defer rotMat.Close()
+	
+	rotated := gocv.NewMat()
+	gocv.WarpAffine(src, &rotated, rotMat, image.Pt(src.Cols(), src.Rows()))
+	return rotated
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func openFirstWorkingCamera() (*gocv.VideoCapture, int, error) {
